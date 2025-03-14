@@ -1,0 +1,2 @@
+class GoogleDocsIntegrationTool:
+    pass

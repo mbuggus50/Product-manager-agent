@@ -1,0 +1,22 @@
+# Node.js
+/node_modules/
+*.log
+/logs/
+
+# Python
+/__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+.env
+/venv/
+ENV/
+*.egg-info/
+
+# Runtime files
+*.pid
+
