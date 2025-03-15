@@ -1,6 +1,18 @@
-import React, { createContext, useContext, useState } from 'react';
+import React, { createContext, useContext, useState, ReactNode } from 'react';
 
-const AuthContext = createContext({
+interface User {
+  username: string;
+}
+
+interface AuthContextType {
+  user: User | null;
+  isAuthenticated: boolean;
+  login: (username: string, password: string) => Promise<void>;
+  logout: () => void;
+  error: string | null;
+}
+
+const AuthContext = createContext<AuthContextType>({
   user: null,
   isAuthenticated: false,
   login: async () => {},
@@ -8,12 +20,16 @@ const AuthContext = createContext({
   error: null,
 });
 
-export const AuthProvider = ({ children }) => {
-  const [user, setUser] = useState(null);
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [error, setError] = useState(null);
+interface AuthProviderProps {
+  children: ReactNode;
+}
 
-  const login = async (username, password) => {
+export const AuthProvider = ({ children }: AuthProviderProps) => {
+  const [user, setUser] = useState<User | null>(null);
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const login = async (username: string, password: string) => {
     // Mock implementation
     setUser({ username });
     setIsAuthenticated(true);
