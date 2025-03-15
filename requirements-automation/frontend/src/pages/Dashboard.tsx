@@ -40,7 +40,7 @@ const Dashboard: React.FC = () => {
     };
 
     fetchRequirements();
-  }, [getRequirements]);
+  }, []); // Remove dependency on getRequirements to avoid infinite loop
 
   const getStatusColor = (status: string) => {
     switch (status) {
