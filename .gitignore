@@ -1,0 +1,28 @@
+# Node.js
+node_modules/
+*.log
+logs/
+**/package-lock.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+.env
+venv/
+ENV/
+*.egg-info/
+
+# Runtime files
+*.pid
+
+# IDE files
+.idea/
+
+# Temporary files
+temp-repo/
