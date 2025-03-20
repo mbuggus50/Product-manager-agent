@@ -1,0 +1,41 @@
+import React from 'react';
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { ThemeProvider, createTheme } from '@mui/material/styles';
+import CssBaseline from '@mui/material/CssBaseline';
+import { Box, Typography, Button } from '@mui/material';
+import Test from './pages/Test';
+
+const theme = createTheme({
+  palette: {
+    primary: {
+      main: '#0077C8', // Blue
+    },
+    secondary: {
+      main: '#6B3FA0', // Purple
+    },
+  },
+});
+
+// Simple home component
+const Home = () => (
+  <Box sx={{ p: 4, textAlign: 'center' }}>
+    <Typography variant="h2" gutterBottom>Welcome to Product Requirements Automation</Typography>
+    <Button variant="contained" color="primary" href="/test">Go to Test Page</Button>
+  </Box>
+);
+
+const App: React.FC = () => {
+  return (
+    <BrowserRouter>
+      <ThemeProvider theme={theme}>
+        <CssBaseline />
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/test" element={<Test />} />
+        </Routes>
+      </ThemeProvider>
+    </BrowserRouter>
+  );
+};
+
+export default App;
