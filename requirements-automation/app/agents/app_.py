@@ -6,8 +6,8 @@ import logging
 from typing import Dict, Any, Optional
 from pathlib import Path
 
-from requirements_automation.base import ExecutiveState
-from requirements_automation.executive_supervisor import create_executive_workflow
+from app.agents.base import ExecutiveState
+from app.agents.executive_supervisor import create_executive_workflow
 
 # Set up logging
 logging.basicConfig(

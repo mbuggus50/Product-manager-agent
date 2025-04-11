@@ -1,13 +1,16 @@
 # requirements_automation/validation_team.py
 
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional, TypedDict, Annotated
 import json
 from pydantic import BaseModel, Field
 
 from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+from langchain_core.tools import Tool
+from langgraph.checkpoint.memory import MemorySaver
 
-from requirements_automation.base import (
+from base import (
     ValidationState, 
     create_llm_node, 
     with_error_handling,
@@ -35,6 +38,68 @@ class ValidationSummary(BaseModel):
     issues_count: int = Field(description="Total number of issues found")
     critical_issues_count: int = Field(description="Number of critical issues found")
     recommendations: List[str] = Field(default_factory=list, description="Overall recommendations")
+
+# Define the human input tool using LangGraph's built-in support
+class RequirementsClarification(TypedDict):
+    """Request for clarification on requirements issues"""
+    question: str
+    context: str
+
+
+def ask_human_for_clarification(state: ValidationState) -> RequirementsClarification:
+    """
+    Requests clarification from a human when requirements are invalid.
+    This is a special node that will pause graph execution and wait for human input.
+    """
+    # Extract issues from validation results
+    completeness_issues = state.completeness_check.get("missing_fields", []) if state.completeness_check else []
+    completeness_recommendations = state.completeness_check.get("recommendations", []) if state.completeness_check else []
+    
+    quality_issues = state.quality_check.get("issues", []) if state.quality_check else []
+    quality_suggestions = state.quality_check.get("suggestions", []) if state.quality_check else []
+    
+    # Create context information
+    context = {
+        "completeness_issues": completeness_issues,
+        "completeness_recommendations": completeness_recommendations,
+        "quality_issues": quality_issues,
+        "quality_suggestions": quality_suggestions,
+        "preprocessed_data": state.preprocessed_data
+    }
+    
+    # Create the clarification message
+    clarification_prompt = """
+    The requirements provided need clarification before they can be processed further.
+    
+    Issues identified:
+    """
+    
+    if completeness_issues:
+        clarification_prompt += "\n\nCompleteness Issues:\n- " + "\n- ".join(completeness_issues)
+    
+    if completeness_recommendations:
+        clarification_prompt += "\n\nRecommendations for Completeness:\n- " + "\n- ".join(completeness_recommendations)
+    
+    if quality_issues:
+        issues_text = []
+        for issue in quality_issues:
+            if isinstance(issue, dict):
+                issue_str = f"{issue.get('requirement_id', 'Unknown')}: {issue.get('description', 'No description')}"
+                issues_text.append(issue_str)
+            else:
+                issues_text.append(str(issue))
+        
+        clarification_prompt += "\n\nQuality Issues:\n- " + "\n- ".join(issues_text)
+    
+    if quality_suggestions:
+        clarification_prompt += "\n\nSuggestions for Improvement:\n- " + "\n- ".join(quality_suggestions)
+    
+    clarification_prompt += """
+    
+    Please provide improved requirements that address these issues.
+    """
+    
+    return {"question": clarification_prompt, "context": json.dumps(context)}
 
 # Agent implementations
 @with_error_handling
@@ -220,7 +285,66 @@ def validation_finalizer(state: ValidationState) -> ValidationState:
     
     return new_state
 
-# Validation Supervisor - Decision function for workflow routing
+@with_error_handling
+def process_human_clarification(state: ValidationState, clarification_response: str) -> ValidationState:
+    """
+    Processes the human's clarification response and updates the requirements.
+    """
+    new_state = state.model_copy(deep=True)
+    
+    # Define the clarification processor agent
+    processor_prompt = """
+    You are a Requirements Clarification Processor. Your job is to:
+    1. Analyze the user's response to clarification requests
+    2. Update the original requirements data based on the clarifications
+    3. Ensure all identified issues are addressed
+    4. Create an improved version of the requirements data
+    
+    Return a JSON object with the updated requirements data.
+    """
+    
+    processor_agent = create_llm_node(
+        system_prompt=processor_prompt,
+        user_prompt="""Process the user's clarification and update the requirements:
+        
+        Original Requirements Data:
+        {preprocessed_data}
+        
+        Validation Issues:
+        {validation_issues}
+        
+        User's Clarification:
+        {clarification_response}
+        
+        Return the updated requirements data as a complete, structured JSON.
+        """,
+        output_parser=JsonOutputParser()
+    )
+    
+    # Process the clarification
+    validation_issues = {}
+    if new_state.completeness_check:
+        validation_issues["completeness"] = new_state.completeness_check
+    if new_state.quality_check:
+        validation_issues["quality"] = new_state.quality_check
+    
+    # Update the preprocessed data with the clarified information
+    updated_data = processor_agent.invoke({
+        "preprocessed_data": json.dumps(new_state.preprocessed_data),
+        "validation_issues": json.dumps(validation_issues),
+        "clarification_response": clarification_response
+    })
+    
+    # Reset validation state to trigger re-validation
+    new_state.preprocessed_data = updated_data
+    new_state.completeness_check = None
+    new_state.quality_check = None
+    new_state.validation_summary = None
+    new_state.status = "clarified"
+    
+    return new_state
+
+# Modified validation router to include human-in-the-loop
 def validation_router(state: ValidationState) -> str:
     """Routes the workflow based on the current state"""
     if state.is_error():
@@ -235,11 +359,29 @@ def validation_router(state: ValidationState) -> str:
     elif not state.validation_summary:
         return "finalize"
     else:
-        return "end"
+        # Check if validation failed but we haven't requested clarification
+        validation_result = state.validation_summary.get("overall_valid", False) if state.validation_summary else False
+        
+        if not validation_result and state.status != "clarified" and state.status != "awaiting_clarification":
+            # Validation failed, request human clarification
+            return "request_clarification"
+        elif state.status == "awaiting_clarification":
+            # Waiting for human input, don't proceed
+            return "wait_for_human"
+        elif state.status == "clarified":
+            # Human provided clarification, restart validation
+            return "check_completeness"
+        elif validation_result:
+            # Validation succeeded
+            return "end"
+        else:
+            # Something unexpected
+            return "error"
 
-# Create the Validation Team workflow
+# Create the Validation Team workflow with human-in-the-loop
 def create_validation_workflow() -> StateGraph:
-    """Creates the Validation Team workflow graph"""
+    """Creates the Validation Team workflow graph with human-in-the-loop capability"""
+    # Create the workflow
     workflow = StateGraph(ValidationState)
     
     # Add nodes
@@ -247,6 +389,17 @@ def create_validation_workflow() -> StateGraph:
     workflow.add_node("check_completeness", completeness_checker)
     workflow.add_node("validate_quality", quality_validator)
     workflow.add_node("finalize", validation_finalizer)
+    
+    # Add the human-in-the-loop nodes using LangGraph's built-in support
+    # This creates a node that will pause execution and wait for human input
+    workflow.add_node("request_clarification", ToolNode(Tool(
+    name="ask_human_for_clarification",
+    description="Request clarification from a human when requirements are invalid",
+    func=ask_human_for_clarification)))
+    workflow.add_node("process_clarification", process_human_clarification)
+    
+    # A special "wait" node that just returns the current state, useful for human-in-the-loop
+    workflow.add_node("wait_for_human", lambda state: state)
     
     # Add conditional edges
     workflow.add_conditional_edges(
@@ -257,6 +410,8 @@ def create_validation_workflow() -> StateGraph:
             "check_completeness": "check_completeness",
             "validate_quality": "validate_quality",
             "finalize": "finalize",
+            "request_clarification": "request_clarification",
+            "wait_for_human": "wait_for_human",
             "error": END,
             "end": END
         }
@@ -267,4 +422,141 @@ def create_validation_workflow() -> StateGraph:
     workflow.add_edge("validate_quality", None)
     workflow.add_edge("finalize", None)
     
-    return workflow.compile()
+    # The request_clarification node updates the state to indicate it's waiting for human input
+    # and the execution gets paused
+    workflow.add_edge("request_clarification", lambda state: {
+        **state.dict(),
+        "status": "awaiting_clarification"
+    })
+    
+    # When human input is received, it goes to the process_clarification node
+    workflow.add_edge("request_clarification", "process_clarification", 
+                     # This edge is taken when human input is provided
+                     condition=lambda state, human_input: human_input is not None)
+    
+    workflow.add_edge("process_clarification", None)
+    
+    # Create memory saver for persistence during human interaction
+    memory_saver = MemorySaver()
+    
+    # Return the compiled workflow with the checkpoint
+    return workflow.compile(checkpointer=memory_saver)
+####################################################
+
+
+
+
+######################################################
+# Usage example:
+def standalone_validation_example():
+    """
+    Example of using the Validation team in isolation with human-in-the-loop.
+    """
+    # Create a validation workflow
+    validation_workflow = create_validation_workflow()
+    
+    # Sample requirements data with intentional issues to trigger validation failures
+    incomplete_requirements = {
+        "project": "Smart Home Control System",
+        "version": "1.0",
+        "requirements": [
+            {
+                "id": "REQ-001",
+                # Missing priority and source
+                "description": "The system shall allow users to control home lighting remotely.",
+                "category": "Functional"
+                # Missing acceptance criteria
+            },
+            {
+                "id": "REQ-002",
+                "description": "The system shall respond to commands quickly.",  # Vague, not measurable
+                "priority": "Medium",
+                "category": "Performance",
+                "source": "Technical Specification",
+                "acceptance_criteria": "Commands are executed promptly."  # Not specific enough
+            }
+        ]
+    }
+    
+    # Create initial validation state
+    initial_state = ValidationState(
+        input_data=incomplete_requirements,
+        status="initialized"
+    )
+    
+    print("\n=== STEP 1: Initial Validation ===")
+    print("Starting validation with incomplete requirements...")
+    
+    # Run validation workflow
+    result = validation_workflow.invoke(initial_state)
+    
+    # Check for human-in-the-loop pause
+    if result.status == "awaiting_clarification":
+        thread_id = validation_workflow.get_current_thread_id()
+        print(f"\n=== STEP 2: Validation Paused ===")
+        print(f"Workflow paused, awaiting human input. Thread ID: {thread_id}")
+        
+        # Extract the clarification request
+        clarification_context = result.metadata.get("clarification_request", {}).get("context", "{}")
+        clarification_question = result.metadata.get("clarification_request", {}).get("question", "No question available")
+        
+        print("\nClarification needed:")
+        print(clarification_question)
+        
+        # Simulate user providing clarification
+        print("\n=== STEP 3: User Provides Clarification ===")
+        user_input = """
+        I've updated the requirements:
+        
+        1. REQ-001:
+           - Added priority: "High"
+           - Added source: "Customer Interview"
+           - Added acceptance criteria: "User can turn lights on/off from the mobile app from any location with internet access."
+        
+        2. REQ-002:
+           - Updated description: "The system shall respond to lighting commands within 1 second under normal network conditions."
+           - Updated acceptance criteria: "Command response time is measured as less than 1 second in 95% of test cases."
+        """
+        
+        print("User response:")
+        print(user_input)
+        
+        # Continue the workflow with user input
+        print("\n=== STEP 4: Continuing Validation ===")
+        print("Continuing validation with updated requirements...")
+        
+        # Resume workflow with user input
+        updated_result = validation_workflow.continue_from_thread(
+            thread_id,
+            user_input
+        )
+        
+        # Check if validation is now successful
+        validation_summary = updated_result.validation_summary or {}
+        is_valid = validation_summary.get("overall_valid", False)
+        
+        print("\n=== STEP 5: Validation Results ===")
+        if updated_result.status == "completed" and is_valid:
+            print("✅ Validation successful!")
+            print(f"Completeness Score: {validation_summary.get('completeness_score', 0) * 100:.1f}%")
+            print(f"Quality Score: {validation_summary.get('quality_score', 0) * 100:.1f}%")
+            print(f"Overall Score: {validation_summary.get('overall_score', 0) * 100:.1f}%")
+        elif updated_result.status == "awaiting_clarification":
+            print("⚠️ Still awaiting clarification. Additional input needed.")
+        else:
+            print("❌ Validation failed after clarification.")
+            
+        # Print the actual updated requirements that were processed
+        print("\n=== Updated Requirements ===")
+        if updated_result.preprocessed_data:
+            print(json.dumps(updated_result.preprocessed_data, indent=2))
+    else:
+        print("Unexpected result: Validation did not request clarification.")
+    
+    return result
+
+if __name__ == "__main__":
+    print("\n🔍 REQUIREMENTS VALIDATION EXAMPLE WITH HUMAN-IN-THE-LOOP 🔍\n")
+    print("This example demonstrates how the validation team works in isolation")
+    print("with LangGraph's human-in-the-loop capabilities.\n")
+    standalone_validation_example()
