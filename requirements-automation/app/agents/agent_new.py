@@ -100,52 +100,75 @@ def build_graph(checkpointer=None):
     return builder.compile(checkpointer=cp)
 # ────────────────────────────────────────────────────────────────
 #demo.py – a tiny “UI”
-import json, sys
+iimport json, sys
 from uuid import uuid4
 from rich import print as rprint
 from requirement_agent.builder import build_graph
 from requirement_agent.schema import IntakeState, PRD
 
-graph = build_graph()
+graph = build_graph()          # single global graph instance
 
-def run_session(initial_request: str, scripted_patches=None):
-    """Run interactively unless scripted_patches list is supplied."""
-    tid = str(uuid4())
-    state = IntakeState(
+
+# ────────────────────────────────────────────────────────────────────
+def _latest_state(events) -> IntakeState:
+    """
+    LangGraph yields many GraphEvent objects; we only care about the
+    *final* state snapshot produced by each .stream() call.
+    """
+    last = None
+    for ev in events:
+        if ev.get("event") in ("on_node_end", "on_interruption"):
+            last = ev["value"]                # plain dict (AddableUpdatesDict)
+    if last is None:
+        raise RuntimeError("No state found in event stream")
+    return IntakeState.model_validate(last)   # cast back to pydantic model
+
+
+def run_session(initial_request: str, scripted_patches: list[dict] | None = None):
+    """
+    • Starts a new LangGraph thread.
+    • Loops until the PRD is generated.
+    • If `scripted_patches` is provided, runs head‑less; otherwise prompts in terminal.
+    """
+    thread_id = str(uuid4())
+
+    # 1️⃣  first invocation --------------------------------------------------
+    start_state = IntakeState(
         user_id="demo-user",
         prd=PRD(raw_request=initial_request),
         messages=[initial_request],
     )
 
-    event_stream = graph.stream(
-        state,
-        config={"configurable": {"thread_id": tid}}
+    state = _latest_state(
+        graph.stream(
+            start_state,
+            config={"configurable": {"thread_id": thread_id}},
+        )
     )
-
-    for event in event_stream:
-        state = event  # last yielded object is always IntakeState
     show(state)
 
-    # Loop until done
-    patches = scripted_patches or []
+    # 2️⃣  clarification / resume loop --------------------------------------
+    patches = scripted_patches[:] if scripted_patches else []     # shallow copy
     while not state.done:
-        if not patches:  # interactive
-            user_json = input("[bold yellow]Enter JSON patch → [/]")
-        else:
-            user_json = json.dumps(patches.pop(0))
-            rprint(f"[cyan]auto‑patch:[/] {user_json}")
+        if patches:                                               # head‑less mode
+            patch = patches.pop(0)
+            rprint(f"[cyan]auto‑patch:[/] {patch}")
+        else:                                                     # interactive
+            user_json = input("[bold yellow]Enter JSON patch → [/] ")
+            patch = json.loads(user_json)
 
-        patch_dict = json.loads(user_json)
-        cmd = {"resume": patch_dict}  # langgraph Command – we can pass dict
-        event_stream = graph.stream(
-            cmd,
-            config={"configurable": {"thread_id": tid}}
+        # resume graph
+        state = _latest_state(
+            graph.stream(
+                {"resume": patch},                               # Command(resume=…)
+                config={"configurable": {"thread_id": thread_id}},
+            )
         )
-        for event in event_stream:
-            state = event
         show(state)
 
-def show(s):
+
+# ────────────────────────────────────────────────────────────────────
+def show(s: IntakeState):
     rprint("\n[bold]Messages so far:[/]")
     for m in s.messages:
         rprint(f"• {m}")
@@ -156,7 +179,8 @@ def show(s):
         rprint(s.prd_markdown)
         rprint("[green]==================[/]\n")
 
-# ── demo scenarios ──────────────────────────────────────────────
+
+# ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--auto":
         run_session(
