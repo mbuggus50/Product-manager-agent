@@ -100,69 +100,73 @@ def build_graph(checkpointer=None):
     return builder.compile(checkpointer=cp)
 # ────────────────────────────────────────────────────────────────
 #demo.py – a tiny “UI”
-iimport json, sys
+import json, sys
 from uuid import uuid4
 from rich import print as rprint
 from requirement_agent.builder import build_graph
 from requirement_agent.schema import IntakeState, PRD
 
-graph = build_graph()          # single global graph instance
+graph = build_graph()                       # global compiled graph
 
 
 # ────────────────────────────────────────────────────────────────────
-def _latest_state(events) -> IntakeState:
+def _state_from_events(events, thread_id: str) -> IntakeState:
     """
-    LangGraph yields many GraphEvent objects; we only care about the
-    *final* state snapshot produced by each .stream() call.
+    Extract the last state snapshot from an event stream.
+    Falls back to graph.get_state() if none found.
     """
     last = None
     for ev in events:
         if ev.get("event") in ("on_node_end", "on_interruption"):
-            last = ev["value"]                # plain dict (AddableUpdatesDict)
-    if last is None:
-        raise RuntimeError("No state found in event stream")
-    return IntakeState.model_validate(last)   # cast back to pydantic model
+            last = ev["value"]              # AddableUpdatesDict -> dict
+
+    if last is None:                       # rare, but be defensive
+        last = graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        ).values
+
+    return IntakeState.model_validate(last)
 
 
 def run_session(initial_request: str, scripted_patches: list[dict] | None = None):
-    """
-    • Starts a new LangGraph thread.
-    • Loops until the PRD is generated.
-    • If `scripted_patches` is provided, runs head‑less; otherwise prompts in terminal.
-    """
-    thread_id = str(uuid4())
+    """Interactive or head‑less clarification loop."""
+    tid = str(uuid4())
 
-    # 1️⃣  first invocation --------------------------------------------------
+    # 1️⃣ kick‑off ------------------------------------------------------------
     start_state = IntakeState(
         user_id="demo-user",
         prd=PRD(raw_request=initial_request),
         messages=[initial_request],
     )
 
-    state = _latest_state(
+    state = _state_from_events(
         graph.stream(
             start_state,
-            config={"configurable": {"thread_id": thread_id}},
-        )
+            config={"configurable": {"thread_id": tid}},
+            stream_mode="events",           # *** IMPORTANT FIX ***
+        ),
+        tid,
     )
     show(state)
 
-    # 2️⃣  clarification / resume loop --------------------------------------
-    patches = scripted_patches[:] if scripted_patches else []     # shallow copy
+    # 2️⃣ resume until PRD ready ---------------------------------------------
+    patches = list(scripted_patches or [])
     while not state.done:
-        if patches:                                               # head‑less mode
-            patch = patches.pop(0)
+        patch = (
+            patches.pop(0)
+            if patches
+            else json.loads(input("[bold yellow]Enter JSON patch → [/] "))
+        )
+        if scripted_patches:
             rprint(f"[cyan]auto‑patch:[/] {patch}")
-        else:                                                     # interactive
-            user_json = input("[bold yellow]Enter JSON patch → [/] ")
-            patch = json.loads(user_json)
 
-        # resume graph
-        state = _latest_state(
+        state = _state_from_events(
             graph.stream(
-                {"resume": patch},                               # Command(resume=…)
-                config={"configurable": {"thread_id": thread_id}},
-            )
+                {"resume": patch},          # Command(resume=…)
+                config={"configurable": {"thread_id": tid}},
+                stream_mode="events",
+            ),
+            tid,
         )
         show(state)
 
