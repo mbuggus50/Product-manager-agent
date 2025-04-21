@@ -160,9 +160,15 @@ def run_session(initial_request: str, scripted_patches: list[dict] | None = None
         if scripted_patches:
             rprint(f"[cyan]auto‑patch:[/] {patch}")
 
+        # 👉 1. wrap under 'prd'
+        update = {"prd": patch}
+
+        # 👉 2. send as Command(resume=…)
+        cmd = Command(resume=update)
+
         state = _state_from_events(
             graph.stream(
-                {"resume": patch},          # Command(resume=…)
+                cmd,
                 config={"configurable": {"thread_id": tid}},
                 stream_mode="events",
             ),
